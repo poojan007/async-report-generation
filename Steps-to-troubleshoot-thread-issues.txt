@@ -1,0 +1,162 @@
+Got it. Hitting a hard ceiling at 5 concurrent runs and needing a server restart almost always points to a resource that’s limited to 5 and not being released. In your stack, there are three prime suspects:
+
+Executor threads stuck (tasks never finish or never return to the pool)
+
+DB connections leaked (Hibernate Sessions/Transactions not closed per task)
+
+Docmosis converter pool exhausted (converters not returned to the pool due to an exception path)
+
+Let’s tackle this methodically.
+
+Quick diagnosis checklist
+A. Confirm you’re not leaking Hibernate resources
+Each report task must use its own Session and Transaction.
+
+Always close them in finally. If an exception happens before commit, you still rollback() then close().
+
+java
+Copy
+Session session = null;
+Transaction tx = null;
+try {
+  session = sessionFactory.openSession();
+  tx = session.beginTransaction();
+  // ... work ...
+  tx.commit();
+} catch (Exception e) {
+  if (tx != null) tx.rollback();
+  // log
+} finally {
+  if (session != null) session.close();
+}
+If your DB pool size is 5 and you leak 5 sessions, everything stalls until restart.
+
+B. Make sure Docmosis converters are returned
+With the embedded API, if DocumentProcessor.renderDoc(...) throws, you must not swallow it and exit early before finishing your code path. The converter should be returned automatically when the call exits, but if your task gets stuck or you catch and then hang, you can starve the converter pool.
+
+Add robust logging around the render call to see start/end and duration.
+
+java
+Copy
+long t0 = System.currentTimeMillis();
+try {
+  DocumentProcessor.renderDoc(template, dataProvider, instruction, baos);
+} finally {
+  long took = System.currentTimeMillis() - t0;
+  log.info("Docmosis render finished in {} ms (reportId={})", took, reportResultId);
+}
+C. Match concurrency to your converter pool
+Your ConverterPoolConfig.xml often limits active converters (commonly 4–8). If the pool is 5 and your executor has 5 threads, that’s OK. But if renders can block (e.g., template IO, massive data), any converter that never returns will freeze the system.
+
+Start by setting the executor max concurrency ≤ converter pool size.
+
+Later you can increase the converter pool after verifying stability.
+
+Harden your Executor (and get visibility)
+Use a ThreadPoolExecutor with a bounded queue, named threads, and metrics. This helps you see if threads are busy or stuck.
+
+java
+Copy
+private static final ThreadFactory NAMED_FACTORY = r -> {
+    Thread t = new Thread(r);
+    t.setName("report-worker-" + t.getId());
+    t.setDaemon(false);
+    return t;
+};
+
+private static final ThreadPoolExecutor EXECUTOR =
+    new ThreadPoolExecutor(
+        5,                       // core
+        5,                       // max: match converter pool first
+        60L, TimeUnit.SECONDS,   // keep-alive
+        new ArrayBlockingQueue<>(100), // bounded queue
+        NAMED_FACTORY,
+        new ThreadPoolExecutor.CallerRunsPolicy() // back-pressure
+    );
+Add a tiny metric log every minute:
+
+java
+Copy
+log.info("reports: poolSize={}, active={}, queued={}, completed={}",
+    EXECUTOR.getPoolSize(),
+    EXECUTOR.getActiveCount(),
+    EXECUTOR.getQueue().size(),
+    EXECUTOR.getCompletedTaskCount());
+If active stays at 5 forever and queued grows, your tasks aren’t finishing.
+
+Put time guards around long renders
+You’re fire-and-forget right now. For safety, wrap the render in a soft timeout and mark the job failed if it grossly exceeds expectations. One simple pattern is to submit the inner render to a single-threaded sub-executor with Future#get(timeout) so your main task can recover and update status.
+
+java
+Copy
+ExecutorService single = Executors.newSingleThreadExecutor(NAMED_FACTORY);
+try {
+  Future<byte[]> fut = single.submit(() -> {
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      DocumentProcessor.renderDoc(template, dataProvider, instruction, baos);
+      return baos.toByteArray();
+  });
+  byte[] data = fut.get(5, TimeUnit.MINUTES); // pick a sane SLA
+  // save data...
+} catch (TimeoutException te) {
+  // mark ReportResult FAILED with reason "timeout"
+  // optional: attempt fut.cancel(true);
+} finally {
+  single.shutdownNow();
+}
+This won’t forcibly kill Docmosis, but it prevents your worker thread from being held hostage indefinitely and at least frees your pool, while you investigate the render stall in logs.
+
+Double-check your initialization pattern
+Initialize Docmosis once on app startup (Listener or static block), not per task.
+
+Don’t re-process template directories on every render.
+
+On app shutdown, call SystemManager.shutdown() to release resources cleanly.
+
+java
+Copy
+// On startup
+SystemManager.initialise();
+DropStoreHelper helper = new DropStoreHelper(TemplateStoreFactory.getStore());
+helper.process(new File(templatePath));
+// On shutdown
+SystemManager.shutdown();
+Improve error handling in the task
+Make sure every failure path updates REPORT_RESULT.status = FAILED and closes resources, so stuck tasks don’t keep the thread.
+
+java
+Copy
+try {
+  // ... set IN_PROGRESS
+  // ... render
+  // ... save document
+  // ... set COMPLETED
+} catch (Exception e) {
+  // set FAILED + message
+  log.error("Report generation failed (id={}): {}", reportResultId, e.getMessage(), e);
+} finally {
+  // absolutely nothing left open (Sessions, Streams)
+}
+Look for these telltale signs
+DB pool metrics show 0 idle connections and no activity ⇒ session leak.
+
+Executor metrics show active=5 for a long time, completed not increasing ⇒ tasks stuck.
+
+Docmosis logs show converters in use never decreasing ⇒ converter leak or stalled render.
+
+If you can, grab a thread dump when it’s stuck. If you see report-worker-* threads blocked inside renderDoc, check templates and data for any pathological cases (huge images, massive loops).
+
+Practical next steps (in order)
+Add the bounded ThreadPoolExecutor + metrics.
+
+Verify per-task Session/Transaction with finally closes (audit your actual code paths).
+
+Ensure single Docmosis init and add start/finish logs around renderDoc.
+
+Temporarily lower executor size to 3 and see if the stall disappears.
+
+Review ConverterPoolConfig.xml (max converters). Keep executor size ≤ that number.
+
+Add the soft timeout wrapper if you still see hangs.
+
+If you want, paste your current GenerateReportAction + ReportGeneratorTask and I’ll mark the exact lines to change for resource safety and a sturdier executor setup.
